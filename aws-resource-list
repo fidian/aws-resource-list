@@ -1,0 +1,1170 @@
+#!/usr/bin/env bash
+#/ AWS Resource List
+#/
+#/ Finds any resources in your AWS account. Displays ARNs when possible and
+#/ falls back to names and IDs when ARNs are not available.
+#/
+#/ Options:
+#/
+#/ --account=NUM   Specifies an account number. Must be the account number,
+#/                 not the account alias.
+#/ --help          Show this message
+#/ --mfa           Enable MFA when using your AWS keys.
+#/ --parallel=NUM  Set the number of parallel AWS calls to perform.
+#/ --regions=REGION1,REGION2,...
+#/                 Specify the list of regions to scan. The default is to
+#/                 scan all regions.
+#/ --role=ROLE     Assumes a role in an account. Must be used with --account.
+#/
+#/ Examples:
+#/
+#/   # Show resources in the current account.
+#/   aws-resource-list
+#/
+#/   # Switch to a role in an account.
+#/   aws-resource-list --account=123456789012 --role=the-role-name
+. bpm
+bpm::include arg
+bpm::include strict
+bpm::include string
+bpm::include parallel
+
+strict::mode
+
+aws-resource-list() {
+    local accountId help mfa parallel region regions role
+
+    (
+        strict::mode
+        arg::getOption accountId --account "$@"
+        arg::getOption help --help "$@"
+        arg::getOption mfa --mfa "$@"
+        arg::getOption parallel --parallel "$@"
+        arg::getOption regions --regions "$@"
+        arg::getOption role --role "$@"
+
+        if [[ -n "$help" ]]; then
+            grep "^#/" "$AWS_RESOURCE_LIST_ORIGINAL_COMMAND" | cut -c 4-
+
+            return
+        fi
+
+        if [[ -n "$mfa" ]]; then
+            awsResourceList::activateMfa
+        fi
+
+        if [[ -n "$role" ]]; then
+            if [[ -z "$accountId" ]]; then
+                echo "Must use --role with --account." >&2
+
+                return 1
+            fi
+
+            awsResourceList::assumeRole "$accountId" "$role"
+        fi
+
+        if [[ -n "$regions" ]]; then
+            string::split regions "$regions" ","
+        else
+            regions=( global $(awsResourceList::awsJq '.Regions[].RegionName' ec2 describe-regions | sort) )
+        fi
+
+        if [[ -n "$parallel" && "$parallel" -gt 0 ]]; then
+            PARALLEL_JOBS=$parallel
+            export PARALLEL_JOBS
+        fi
+
+        awsResourceList::showAccountInformation "$accountId" "${regions[*]}"
+
+        for region in "${regions[@]}"; do
+            if [[ "$region" == "global" ]]; then
+                awsResourceList::scanGlobal "$accountId"
+            else
+                awsResourceList::scanRegion "$accountId" "$region"
+            fi
+        done
+
+        parallel::finish
+    )
+}
+
+
+# Gets a session token that's backed by MFA. Assumes the MFA device is named
+# after the user, which is how it generates the MFA ARN.
+#
+# Examples
+#
+#   awsResourceList::activateMfa
+#
+# Returns 0 on success and updates environment variables so subsequent calls
+# use this session. Returns 1 on a random error. Returns 2 when the MFA code
+# is empty. Returns 3 when access was denied.
+awsResourceList::activateMfa() {
+    local accountId json mfaArn mfaCode username
+
+    accountId=$(awsResourceList::awsJq '.Account' sts get-caller-identity)
+    username=$(awsResourceList::awsJq '.User.UserName' iam get-user)
+    mfaArn="arn:aws:iam::$accountId:mfa/$username"
+    read -p "MFA code for $username: " mfaCode
+
+    if [[ -z "$mfaCode" ]]; then
+        echo "Aborting" >&2
+
+        return 2
+    fi
+
+    json=$(aws sts get-session-token --serial-number="$mfaArn" --token-code="$mfaCode" 2>&1 || :)
+
+    if [[ "$json" == *AccessDenied*GetSessionToken* ]]; then
+        echo "Error: Access Denied" >&2
+        echo "$json"
+
+        return 2
+    fi
+    
+    if ! awsResourceList::isCredentialsJson "$json"; then
+        echo "Error detected:" >&2
+        echo "$json" >&2
+
+        return 1
+    fi
+
+    awsResourceList::setCredentials "$json"
+}
+
+
+# Calls AWS and formats the results as an ARN if they are not already
+# formatted that way.
+#
+# $1    - AWS subsystem.
+#
+# Returns nothing.
+awsResourceList::arn() {
+    local subsystem
+
+    subsystem=$1
+
+    while IFS= read -r line; do
+        if [[ "$line" != arn:* ]]; then
+            echo "fake_arn:aws:$subsystem:${AWS_DEFAULT_REGION-}:$AWS_RESOURCE_LIST_ACCOUNT_ID:$line"
+        else
+            echo "$line"
+        fi
+    done
+}
+
+
+# Assumes a role for an account.
+#
+# $1 - AWS Account ID. Number only.
+# $2 - Role name to assume.
+#
+# Returns 0 on success and sets credentials in the environment for the new
+# session. Returns 1 on a generic error. Returns 2 when access was denied.
+awsResourceList::assumeRole() {
+    local arn
+
+    arn="arn:aws:iam::$1:role/$2"
+    json=$(aws sts assume-role --role-arn "$arn" --role-session-name "aws-resource-list" 2>&1 || :)
+
+    if [[ "$json" == *AccessDenied*AssumeRole* ]]; then
+        echo "Error: Access Denied" >&2
+        echo "$json"
+
+        return 2
+    fi
+
+    if ! awsResourceList::isCredentialsJson "$json"; then
+        echo "Error:" >&2
+        echo "$json"
+
+        return 1
+    fi
+
+    awsResourceList::setCredentials "$json"
+}
+
+
+# Calls AWS. Ignores specific errors.
+#
+# $@ - AWS call parameters
+#
+# Returns 0 on success or on suppressed error. Returns anything else when
+# there is a non-suppressed error.
+awsResourceList::awsAndIgnoreSomeErrors() {
+    local statusCode stderr stdout
+
+    stdout=$(mktemp)
+    stderr=$(mktemp)
+    strict::run statusCode aws "$@" > "$stdout" 2> "$stderr"
+    stdout=$(cat "$stdout"; rm "$stdout");
+    stderr=$(cat "$stderr"; rm "$stderr");
+
+    if [[ "$statusCode" -eq 0 ]]; then
+        echo "$stdout"
+
+        return 0
+    fi
+
+    if [[ "$stderr" == *AccessDeniedException* ]]; then
+        # An error occurred (AccessDeniedException) when calling the
+        # GetClassifiers operation:
+        #
+        # An error occurred (AccessDeniedException) when calling the
+        # GetConnections operation: 
+        #
+        # An error occurred (AccessDeniedException) when calling the
+        # GetCrawlers operation: 
+        #
+        # An error occurred (AccessDeniedException) when calling the
+        # GetDatabases operation: 
+        #
+        # An error occurred (AccessDeniedException) when calling the
+        # GetDevEndpoints operation: 
+        #
+        # An error occurred (AccessDeniedException) when calling the
+        # ListProjects operation: 
+        #
+        # ... and so on
+        :
+    elif [[ "$stderr" == *AuthFailure* ]]; then
+        # An error occurred (AuthFailure) when calling the
+        # DescribeElasticGpus operation: This request has been
+        # administratively disabled.
+        #
+        # An error occurred (AuthFailure) when calling the
+        # DescribeMovingAddresses operation: This request has been
+        # administratively disabled.
+        :
+    elif [[ "$stderr" == *ClientException*DescribeJobQueues* ]]; then
+        # An error occurred (ClientException) when calling the
+        # DescribeJobQueues operation: Error executing request, Exception :
+        # This user account is not authorized: ...
+        :
+    elif [[ "$stderr" == *CloudHsmServiceException* ]]; then
+        # An error occurred (CloudHsmServiceException) when calling the
+        # ListHapgs operation: This service is unavailable.  Please see
+        # https://aws.amazon.com/cloudhsm/faqs-classic/
+        #
+        # An error occurred (CloudHsmServiceException) when calling the
+        # ListHsms operation: This service is unavailable.  Please see
+        # https://aws.amazon.com/cloudhsm/faqs-classic/
+        #
+        # An error occurred (CloudHsmServiceException) when calling the
+        # ListLunaClients operation: This service is unavailable.
+        # Please see https://aws.amazon.com/cloudhsm/faqs-classic/
+        :
+    elif [[ "$stderr" == *DirectConnectClientException*DescribeInterconnects* ]]; then
+        # An error occurred (DirectConnectClientException) when calling the
+        # DescribeInterconnects operation: Account ... is not an authorized
+        # Direct Connect partner.
+        :
+    elif [[ "$stderr" == *InvalidAction*DescribeFpgaImages* ]]; then
+        # An error occurred (InvalidAction) when calling the DescribeFpgaImages
+        # operation: The action DescribeFpgaImages is not valid for this web
+        # service.
+        :
+    elif [[ "$stderr" == *InvalidGatewayRequestException* ]]; then
+        # An error occurred (InvalidGatewayRequestException) when calling the
+        # DescribeTapeArchives operation: The specified request contains
+        # invalid parameters.
+        #
+        # An error occurred (InvalidGatewayRequestException) when calling the
+        # ListTapes operation: Attempting to list tapes in non-VTL region:
+        :
+    elif [[ "$stderr" == *InvalidInputException*GetDomains* ]]; then
+        # An error occurred (InvalidInputException) when calling the GetDomains
+        # operation: Domain-related APIs are only available in the us-east-1
+        # Region. Please set your Region configuration to us-east-1 to create,
+        # view, or edit these resources.
+        :
+    elif [[ "$stderr" == *InvalidParameterValue*DescribeCacheSecurityGroups* ]]; then
+        # An error occurred (InvalidParameterValue) when calling the
+        # DescribeCacheSecurityGroups operation: Use of cache security groups
+        # is not permitted in this API version for your account.
+        :
+    elif [[ "$stderr" == *InvalidParameterValue*DescribeClusters* ]]; then
+        # An error occurred (InvalidParameterValueException) when calling the
+        # DescribeClusters operation: Access Denied to API Version: DAX_V3
+        :
+    elif [[ "$stderr" == *InvalidParameterValue*DescribeClusterSecurityGroups* ]]; then
+        # An error occurred (InvalidParameterValue) when calling the
+        # DescribeClusterSecurityGroups operation: VPC-by-Default customers
+        # cannot use cluster security groups
+        :
+    elif [[ "$stderr" == *ResourceNotFoundException*ListProtections* ]]; then
+        # An error occurred (ResourceNotFoundException) when calling the
+        # ListProtections operation: The subscription does not exist.
+        :
+    elif [[ "$stderr" == *UnsupportedOperation* ]]; then
+        # An error occurred (InvalidAction) when calling the
+        # DescribeFpgaImages operation: The action DescribeFpgaImages is
+        # not valid for this web service.
+        #
+        # An error occurred (UnsupportedOperation) when calling the
+        # DescribeConversionTasks operation: The functionality you requested is
+        # not available in this region.
+        #
+        # An error occurred (UnsupportedOperation) when calling the
+        # DescribeMovingAddresses operation: The functionality you
+        # requested is not available in this region.
+        #
+        # An error occurred (UnsupportedOperation) when calling the
+        # DescribeScheduledInstances operation: The functionality you requested
+        # is not available in this region.
+        :
+    elif [[ "$stderr" == *UnsupportedRegionException* ]]; then
+        # An error occurred (UnsupportedRegionException) when calling the
+        # DescribeMatchmakingConfigurations operation: This region is not
+        # supported.
+        #
+        # An error occurred (UnsupportedRegionException) when calling the
+        # DescribeMatchmakingRuleSets operation: This region is not supported.
+        :
+    else
+        # All other errors
+        echo "FAIL STDOUT" >&2
+        echo "$stdout" >&2
+        echo "FAIL STDERR" >&2
+        echo "$stderr" >&2
+        echo "FAIL ARGS: $*" >&2
+
+        echo "$stdout"
+    fi
+}
+
+
+# Calls AWS and passes it through `jq` to grab some chunk from the response.
+#
+# $1    - `jq` statement to execute.
+# $2-$@ - AWS call.
+#
+# Returns nothing.
+awsResourceList::awsJq() {
+    local jqCommand
+
+    jqCommand=$1
+    shift
+
+    aws "$@" | jq -r "$jqCommand"
+}
+
+
+# Determines if the JSON payload contains credentials or not.
+#
+# $1 - JSON payload.
+#
+# Returns 0 if it does, 1 if it does not.
+awsResourceList::isCredentialsJson() {
+    if ! jq . <<< "$1" &> /dev/null; then
+        return 1
+    fi
+
+    if [[ -z "$(jq -r '.Credentials // ""' <<< "$json")" ]]; then
+        return 2
+    fi
+
+    return 0
+}
+
+
+# Queries the AWS API for some ARNs. It does this in parallel. This function
+# exists to help cut down on the redundant code.
+#
+# $1    - `jq` command.
+# $2-$@ - Arguments to pass to the `aws` command.
+#
+# Returns nothing.
+awsResourceList::query() {
+    parallel::run awsResourceList::queryParallel "$@"
+}
+
+# Queries the AWS API, ran in parallel.
+#
+# $1    - `jq command`
+# $2-$@ - Arguments to pass to the `aws` command.
+#
+# Returns nothing.
+awsResourceList::queryParallel() {
+    local jqCommand output
+   
+    jqCommand=$1
+    shift
+    output=$(awsResourceList::awsAndIgnoreSomeErrors "$@")
+    
+    if [[ -n "$output" ]]; then
+        jq -r "$jqCommand" <<< "$output" | awsResourceList::arn "$1" || echo -e "ERROR_WITH_STDIN\n$output\nERROR_WITH_STDIN_ARGS: $*" >&2
+    fi
+}
+
+
+# Determines if a region supports a service.
+#
+# $1 - Service
+#
+# Uses `$AWS_DEFAULT_REGION`.
+#
+# Returns true (0) if the region supports the service. If not, any other
+# value is returned.
+awsResourceList::regionSupports() {
+    getent hosts "$1.$AWS_DEFAULT_REGION.amazonaws.com" &> /dev/null
+}
+
+
+# Displays an S3 bucket if it is in the matching region
+#
+# $1 - Bucket name.
+# $2 - Region that we're scanning.
+#
+# Returns nothing.
+awsResourceList::s3Bucket() {
+    local location
+    
+    location=$(aws s3api get-bucket-location --bucket "$1" | jq -r ".LocationConstraint")
+
+    if [[ "$location" == "$2" ]]; then
+        echo "fake_arn:aws:s3:$2:$AWS_RESOURCE_LIST_ACCOUNT_ID:bucket:$location"
+    fi
+}
+
+
+# Scans global resources. This is limited to just the global-ish services.
+#
+# $1 - Account ID
+#
+# Returns nothing.
+awsResourceList::scanGlobal() {
+    unset AWS_DEFAULT_REGION
+
+    # iam
+    awsResourceList::query '.Groups[] | .Arn' iam list-groups
+    awsResourceList::query '.InstanceProfiles[] | .Arn' iam list-instance-profiles
+    awsResourceList::query '.OpenIDConnectProviderList[] | .Arn' iam list-open-id-connect-providers
+    awsResourceList::query '.Policies[] | .Arn' iam list-policies --scope Local
+    awsResourceList::query '.Roles[] | .Arn' iam list-roles
+    awsResourceList::query '.SAMLProviderList[] | .Arn' iam list-saml-providers
+    awsResourceList::query '.ServerCertificateMetadataList[] | .Arn' iam list-server-certificates
+    awsResourceList::query '.Users[] | .Arn' iam list-users
+
+    # s3
+
+    # s3api
+    awsResourceList::query '.Buckets[] | "bucket:" + .Name' s3api list-buckets
+}
+
+# Scans a region for all resources.
+#
+# $1 - Account ID
+# $2 - Region to scan
+#
+# Returns nothing.
+awsResourceList::scanRegion() {
+    local accountId region
+
+    accountId=$1
+    region=$2
+    AWS_DEFAULT_REGION=$2
+    export AWS_DEFAULT_REGION
+
+    # acm
+    if awsResourceList::regionSupports acm; then
+        awsResourceList::query '.CertificateSummaryList[] | .CertificateArn + "\t" + .DomainName' acm list-certificates
+    fi
+
+    # apigateway
+    if awsResourceList::regionSupports apigateway; then
+        awsResourceList::query '.items[] | "apiKey:" + .id + ":apiKeyName/" + .name' apigateway get-api-keys
+        awsResourceList::query '.items[] | "clientCertificate:" + .clientCertificateId' apigateway get-client-certificates
+        awsResourceList::query '.items[] | "domainName:" + .domainName' apigateway get-domain-names
+        awsResourceList::query '.items[] | "restApi:" + .id + ":restApiName/" + .name' apigateway get-rest-apis
+        awsResourceList::query '.items[] | "usagePlan:" + .id + ":usagePlanName/" + .name' apigateway get-usage-plans
+    fi
+
+    # application-autoscaling
+    if awsResourceList::regionSupports application-autoscaling; then
+        awsResourceList::query '.ScalingPolicies[] | .PolicyArn' application-autoscaling describe-scaling-policies --service-namespace appstream
+        awsResourceList::query '.ScalingPolicies[] | .PolicyArn' application-autoscaling describe-scaling-policies --service-namespace dynamodb
+        awsResourceList::query '.ScalingPolicies[] | .PolicyArn' application-autoscaling describe-scaling-policies --service-namespace ec2
+        awsResourceList::query '.ScalingPolicies[] | .PolicyArn' application-autoscaling describe-scaling-policies --service-namespace ecs
+        awsResourceList::query '.ScalingPolicies[] | .PolicyArn' application-autoscaling describe-scaling-policies --service-namespace elasticmapreduce
+    fi
+
+    # appstream
+    if awsResourceList::regionSupports appstream; then
+        awsResourceList::query '.DirectoryConfigs[] | "directoryConfig:" + .DirectoryName' appstream describe-directory-configs
+        awsResourceList::query '.Fleets[] | .Arn' appstream describe-fleets
+        awsResourceList::query '.ImageBuilders[] | .Arn' appstream describe-image-builders
+        awsResourceList::query '.Images[] | select(.Arn | contains("::image/") | not) | .Arn' appstream describe-images
+        awsResourceList::query '.Stacks[] | .Arn' appstream describe-stacks
+    fi
+
+    # athena
+    if awsResourceList::regionSupports athena; then
+        awsResourceList::query '.NamedQueryIds[] | "namedQuery:" + .' athena list-named-queries
+        awsResourceList::query '.QueryExecutionIds[] | "queryExecution:" + .' athena list-query-executions
+    fi
+
+    # autoscaling
+    if awsResourceList::regionSupports autoscaling; then
+        awsResourceList::query '.AutoScalingGroups[] | .AutoScalingGroupARN' autoscaling describe-auto-scaling-groups
+        awsResourceList::query '.LaunchConfigurations[] | .LaunchConfigurationARN' autoscaling describe-launch-configurations
+    fi
+
+    # batch
+    if awsResourceList::regionSupports batch; then
+        awsResourceList::query '.jobQueues[] | .jobQueueArn' batch describe-job-queues
+    fi
+
+    # budgets
+    if awsResourceList::regionSupports budgets; then
+        awsResourceList::query '.Budgets[] | "budget:" + .BudgetName' budgets describe-budgets --account-id "$AWS_RESOURCE_LIST_ACCOUNT_ID"
+    fi
+
+    # clouddirectory
+    if awsResourceList::regionSupports clouddirectory; then
+        awsResourceList::query '.Directories[] | .DirectoryArn' clouddirectory list-directories
+    fi
+
+    # cloudformation
+    if awsResourceList::regionSupports cloudformation; then
+        awsResourceList::query '.StackSummaries[] | .StackId' cloudformation list-stacks
+    fi
+
+    # cloudfront
+    if awsResourceList::regionSupports cloudfront; then
+        awsResourceList::query '.CloudFrontOriginAccessIdentityList.Items[] | "originAccessIdentitiy:" + .Id' cloudfront list-cloud-front-origin-access-identities
+        awsResourceList::query '.DistributionList.Items[] | .ARN' cloudfront list-distributions
+        awsResourceList::query '.StreamingDistributionsList.Items[] | .ARN' cloudfront list-streaming-distributions
+    fi
+
+    # cloudhsm
+    if awsResourceList::regionSupports cloudhsm; then
+        awsResourceList::query '.HapgList[] | "hapg:" + .' cloudhsm list-hapgs
+        awsResourceList::query '.HsmList[] | "hsm:" + .' cloudhsm list-hsms
+        awsResourceList::query '.ClientList[] | "lunaClient:" + .' cloudhsm list-luna-clients
+    fi
+
+    # cloudhsmv2
+    if awsResourceList::regionSupports cloudhsmv2; then
+        awsResourceList::query '.Backups[] | "backup:" + .BackupId' cloudhsmv2 describe-backups
+        awsResourceList::query '.Clusters[] | "cluster:" + .ClusterId' cloudhsmv2 describe-clusters
+    fi
+
+    # cloudsearch
+    if awsResourceList::regionSupports cloudsearch; then
+        awsResourceList::query '.DomainNames[] | "domain:" + .key' cloudsearch list-domain-names
+    fi
+
+    # cloudsearchdomain
+
+    # cloudtrail
+    if awsResourceList::regionSupports cloudtrail; then
+        awsResourceList::query '.trailList[] | .TrailARN' cloudtrail describe-trails
+    fi
+
+    # cloudwatch
+    if awsResourceList::regionSupports cloudwatch; then
+        awsResourceList::query '.MetricAlarms[] | .AlarmArn' cloudwatch describe-alarms
+    fi
+
+    # codebuild
+    if awsResourceList::regionSupports codebuild; then
+        awsResourceList::query '.projects[] | "project:" + .' codebuild list-projects
+    fi
+
+    # codecommit
+    if awsResourceList::regionSupports codecommit; then
+        awsResourceList::query '.repositories[] | "repository:" + .repositoryId + ":repositoryName/" + .repositoryName' codecommit list-repositories
+    fi
+
+    # codepipeline
+    if awsResourceList::regionSupports codepipeline; then
+        awsResourceList::query '.pipelines[] | "pipeline:" + .name' codepipeline list-pipelines
+    fi
+
+    # codestar
+    if awsResourceList::regionSupports codestar; then
+        awsResourceList::query '.projects[] | .projectArn' codestar list-projects
+    fi
+
+    # cognito-identity
+    if awsResourceList::regionSupports cognito-identity; then
+        awsResourceList::query '.IdentityPools[] | "identityPool:" + .IdentityPoolId + ":identityPoolName/" + .IdentityPoolName' cognito-identity list-identity-pools --max-results 60
+    fi
+
+    # cognito-idp
+    if awsResourceList::regionSupports cognito-idp; then
+        awsResourceList::query '.UserPools[] | "userPool:" + .Id + ":userPoolName/" + .Name' cognito-idp list-user-pools --max-results 60
+    fi
+
+    # cognito-sync
+
+    # configservice
+    if awsResourceList::regionSupports configservice; then
+        awsResourceList::query '.ConfigRules[] | .ConfigRuleArn' configservice describe-config-rules
+    fi
+
+    # cur
+
+    # datapipeline
+    if awsResourceList::regionSupports datapipeline; then
+        awsResourceList::query '.pipelineIdList[] | "pipeline:" + .id + ":pipelineName/" + .name' datapipeline list-pipelines
+    fi
+
+    # dax
+    if awsResourceList::regionSupports dax; then
+        awsResourceList::query '.Clusters[] | .ClusterArn' dax describe-clusters
+    fi
+
+    # deploy
+    if awsResourceList::regionSupports deploy; then
+        awsResourceList::query '.applications[] | "application:" + .' deploy list-applications
+        awsResourceList::query '.deployments[] | "deployment:" + .' deploy list-deployments
+        awsResourceList::query '.tokenNameList[] | "gitHubAccountToken:" + .' deploy list-git-hub-account-token-names
+        awsResourceList::query '.instanceNames[] | "onPremisesInstance:" + .' deploy list-on-premises-instances
+    fi
+
+    # devicefarm
+    if awsResourceList::regionSupports devicefarm; then
+        awsResourceList::query '.projects[] | .arn' devicefarm list-projects
+    fi
+
+    # directconnect
+    if awsResourceList::regionSupports directconnect; then
+        awsResourceList::query '.connections[] | "connection:" + .connectionId' directconnect describe-connections
+        awsResourceList::query '.interconnects[] | "interconnect:" + .interconnectId' directconnect describe-interconnects
+        awsResourceList::query '.lags[] | "lag:" + .lagId + ":lagName/" + .lagName' directconnect describe-lags
+        awsResourceList::query '.virtualGateways[] | "virtualGateway:" + .virtualGatewayId' directconnect describe-virtual-gateways
+        awsResourceList::query '.virtualInterfaces[] | "virtualInterface:" + .virtualInterfaceId' directconnect describe-virtual-interfaces
+    fi
+    
+    # discovery
+    if awsResourceList::regionSupports discovery; then
+        awsResourceList::query '.Snapshots[] | "agent:" + .agentId' discovery describe-agents
+        awsResourceList::query '.exportsInfo[] | "exportConfiguration:" + .exportId' discovery describe-export-configurations
+        awsResourceList::query '.exportsInfo[] | "exportTask:" + .exportId' discovery describe-export-tasks
+    fi
+
+    # dms
+    if awsResourceList::regionSupports dms; then
+        awsResourceList::query '.Certificates[] | .CertificateArn' dms describe-certificates
+        awsResourceList::query '.Endpoints[] | .EndpointArn' dms describe-endpoints
+        awsResourceList::query '.ReplicationInstances[] | .ReplicationInstanceArn' dms describe-replication-instances
+        awsResourceList::query '.ReplicationTasks[] | .ReplicationTaskArn' dms describe-replication-tasks
+    fi
+
+    # ds
+    if awsResourceList::regionSupports ds; then
+        awsResourceList::query '.DirectoryDescriptions[] | "directory:" + .DirectoryId' ds describe-directories
+        awsResourceList::query '.Snapshots[] | "snapshot:" + .SnapshotId' ds describe-snapshots
+        awsResourceList::query '.Trusts[] | "trust:" + .TrustId' ds describe-trusts
+    fi
+
+    # dynamodb
+    if awsResourceList::regionSupports dynamodb; then
+        awsResourceList::query '.TableNames[] | "table:" + .' dynamodb list-tables
+    fi
+
+    # dynamodbstreams
+    if awsResourceList::regionSupports dynamodbstreams; then
+        awsResourceList::query '.Streams[] | .StreamArn + "\t" + .TableName' dynamodbstreams list-streams
+    fi
+
+    # ec2
+    if awsResourceList::regionSupports ec2; then
+        awsResourceList::query '.Addresses[] | "elasticIp:" + .AllocationId' ec2 describe-addresses
+        awsResourceList::query '.BundleTasks[] | "bundleTask:" + .BundleId' ec2 describe-bundle-tasks
+        awsResourceList::query '.Instances[] | "classicLink:" + .InstanceId' ec2 describe-classic-link-instances
+        awsResourceList::query '.ConversionTasks[] | "conversionTask:" + .ConversionTaskId' ec2 describe-conversion-tasks
+        awsResourceList::query '.CustomerGateways[] | "customerGateway:" + .CustomerGatewayId' ec2 describe-customer-gateways
+        awsResourceList::query '.DhcpOptions[] | "dhcpOptions:" + .DhcpOptionsId' ec2 describe-dhcp-options
+        awsResourceList::query '.EgressOnlyInternetGateways[] | "egressOnlyInternetGateway:" + .EgressOnlyInternetGatewayId' ec2 describe-egress-only-internet-gateways
+        awsResourceList::query '.ElasticGpuSet[] | "elasticGpu:" + .ElasticGpuId' ec2 describe-elastic-gpus
+        awsResourceList::query '.ExportTasks[] | "exportTask:" + .ExportTaskId' ec2 describe-export-tasks
+        awsResourceList::query '.FlowLogs[] | "flowLog:" + .FlowLogId + ":resourceId/" + .ResourceId' ec2 describe-flow-logs
+        awsResourceList::query '.FpgaImages[] | "fpgaImage:" + .FpgaImageId' ec2 describe-fpga-images
+        awsResourceList::query '.HostReservationSet[] | "hostReservation:" + .HostReservationId' ec2 describe-host-reservations
+        awsResourceList::query '.Hosts[] | "host:" + .HostId' ec2 describe-hosts
+        awsResourceList::query '.IamInstanceProfileAssociations[] | "instanceProfileAssociation:" + .AssociationId' ec2 describe-iam-instance-profile-associations
+        awsResourceList::query '.Images[] | "image:" + .ImageId' ec2 describe-images --owner self
+        awsResourceList::query '.ImportImageTasks[] | "importImageTask:" + .ImportTaskId' ec2 describe-import-image-tasks
+        awsResourceList::query '.ImportSnapshotTasks[] | "importSnapshotTask:" + .ImportTaskId' ec2 describe-import-snapshot-tasks
+        awsResourceList::query '.Reservations[] | .Instances[] | "instance:" + .InstanceId' ec2 describe-instances
+        awsResourceList::query '.InternetGateways[] | "internetGateway:" + .InternetGatewayId' ec2 describe-internet-gateways
+        awsResourceList::query '.KeyPairs[] | "keyPair:" + .KeyName' ec2 describe-key-pairs
+        awsResourceList::query '.MovingAddressStatuses[] | "movingAddresses:" + .PublicIp' ec2 describe-moving-addresses
+        awsResourceList::query '.NatGateways[] | "natGateway:" + .NatGatewayId' ec2 describe-nat-gateways
+        awsResourceList::query '.NetworkAcls[] | .NetworkAclId' ec2 describe-network-acls
+        awsResourceList::query '.NetworkInterfaces[] | .NetworkInterfaceId' ec2 describe-network-interfaces
+        awsResourceList::query '.PlacementGroups[] | "placementGroup:" + .GroupName' ec2 describe-placement-groups
+        awsResourceList::query '.PrefixLists[] | "prefixList:" + .PrefixListId + ":prefixListName/" + .PrefixListName' ec2 describe-prefix-lists
+        awsResourceList::query '.ReservedInstances[] | "reservedInstance:" + .ReservedInstanceId' ec2 describe-reserved-instances
+        awsResourceList::query '.RouteTables[] | "routeTable:" + .RouteTableId' ec2 describe-route-tables
+        awsResourceList::query '.ScheduledInstanceSet[] | "scheduledInstance:" + .ScheduledInstanceId' ec2 describe-scheduled-instances
+        awsResourceList::query '.SecurityGroups[] | "securityGroup:" + .GroupId' ec2 describe-security-groups
+        awsResourceList::query '.Snapshots[] | "snapshot:" + .SnapshotId' ec2 describe-snapshots --owner-id self
+        awsResourceList::query '.SpotFleetRequestConfigs[] | "spotFleetRequest:" + .SpotFleetRequestId' ec2 describe-spot-fleet-requests
+        awsResourceList::query '.SpotInstanceRequests[] | "spotInstanceRequest:" + .SpotInstanceRequestId' ec2 describe-spot-instance-requests
+        awsResourceList::query '.Subnets[] | "subnet:" + .SubnetId' ec2 describe-subnets
+        awsResourceList::query '.Volumes[] | "volume:" + .VolumeId' ec2 describe-volumes
+        awsResourceList::query '.VpcEndpoints[] | "vpcEndpoint:" + .VpcEndpointId' ec2 describe-vpc-endpoints
+        awsResourceList::query '.VpcPeeringConnections[] | "vpcPeeringConnection:" + .VpcPeeringConnectionId' ec2 describe-vpc-peering-connections
+        awsResourceList::query '.Vpcs[] | "vpc:" + .VpcId' ec2 describe-vpcs
+        awsResourceList::query '.VpnConnections[] | "vpnConnection:" + .VpnConnectionId' ec2 describe-vpn-connections
+        awsResourceList::query '.VpnGateways[] | "vpnGateway:" + .VpnGatewayId' ec2 describe-vpn-gateways
+    fi
+
+    # ecr
+    if awsResourceList::regionSupports ecr; then
+        awsResourceList::query '.repositories[] | "registry:" + .registryId + ":registryName/" + .registryName' ecr describe-repositories
+    fi
+    
+    # ecs
+    if awsResourceList::regionSupports ecs; then
+        awsResourceList::query '.clusterArns[]' ecs list-clusters
+        awsResourceList::query '.taskDefinitionArns[]' ecs list-task-definitions
+    fi
+    
+    # elasticache
+    if awsResourceList::regionSupports elasticache; then
+        awsResourceList::query '.CacheClusters[] | "cacheCluster:" + .CacheClusterId' elasticache describe-cache-clusters
+        awsResourceList::query '.CacheSecurityGroups[] | "cacheSecurityGroup:" + .CacheSecurityGroupName' elasticache describe-cache-security-groups
+        awsResourceList::query '.CacheSubnetGroups[] | "cacheSubnetGroup:" + .CacheSubnetGroupName' elasticache describe-cache-subnet-groups
+        awsResourceList::query '.ReplicationGroups[] | "replicationGroup:" + .ReplicationGroupId' elasticache describe-replication-groups
+        awsResourceList::query '.ReservedCacheNodes[] | "reservedCacheNode:" + .ReservedCacheNodeId' elasticache describe-reserved-cache-nodes
+    fi
+
+    # elasticbeanstalk
+    if awsResourceList::regionSupports elasticbeanstalk; then
+        awsResourceList::query '.Applications[] | "application:" + .ApplicationName' elasticbeanstalk describe-applications
+        awsResourceList::query '.Environments[] | "environment:" + .EnvironmentId + ":environmentName/" + .EnvironmentName' elasticbeanstalk describe-environments
+    fi
+
+    # elastictranscoder
+    if awsResourceList::regionSupports elastictranscoder; then
+        awsResourceList::query '.Pipelines[] | .Arn' elastictranscoder list-pipelines
+    fi
+
+    # elb
+    if awsResourceList::regionSupports elb; then
+        awsResourceList::query '.LoadBalancerDescriptions[] | "loadBalancer:" + .LoadBalancerName' elb describe-load-balancers
+    fi
+
+    # elbv2
+    if awsResourceList::regionSupports elbv2; then
+        awsResourceList::query '.LoadBalancers[] | .LoadBalancerArn' elbv2 describe-load-balancers
+        awsResourceList::query '.TargetGroups[] | .TargetGroupArn' elbv2 describe-target-groups
+    fi
+
+    # emr
+    if awsResourceList::regionSupports emr; then
+        awsResourceList::query '.Clusters[] | "cluster:" + .Id + ":clusterName/" + .Name' emr list-clusters
+        awsResourceList::query '.SecurityConfigurations[] | "securityConfiguration:" + .Name' emr list-security-configurations
+    fi
+
+    # es
+    if awsResourceList::regionSupports es; then
+        awsResourceList::query '.DomainNames[] | "domainName:" + .' es list-domain-names
+    fi
+
+    # events
+    if awsResourceList::regionSupports events; then
+        awsResourceList::query '.Rules[] | .Arn' events list-rules
+    fi
+
+    # firehose
+    if awsResourceList::regionSupports firehose; then
+        awsResourceList::query '.DeliveryStreamNames[] | "deliveryStream:" + .' firehose list-delivery-streams
+    fi
+
+    # gamelift
+    if awsResourceList::regionSupports gamelift; then
+        awsResourceList::query '.GameSessionQueues[] | .GameSessionQueueArn' gamelift describe-game-session-queues
+        awsResourceList::query '.Configurations[] | "matchmakingConfiguration:" + .Name' gamelift describe-matchmaking-configurations
+        awsResourceList::query '.RuleSets[] | "ruleSet:" + .RuleSetName' gamelift describe-matchmaking-rule-sets
+        awsResourceList::query '.VpcPeeringConnections[] | "vpcPeeringConnection:" + .VpcPeeringConnectionId' gamelift describe-vpc-peering-connections
+        awsResourceList::query '.Aliases[] | .AliasArn' gamelift list-aliases
+        awsResourceList::query '.Builds[] | "build:" + .BuildId + ":buildName/" + .Name + ":buildVersion/" + .Version' gamelift list-builds
+        awsResourceList::query '.FleetIds[] | "fleet:" + .' gamelift list-fleets
+    fi
+
+    # glacier
+    if awsResourceList::regionSupports glacier; then
+        awsResourceList::query '.VaultList[] | .VaultArn' glacier list-vaults --account-id "$AWS_RESOURCE_LIST_ACCOUNT_ID"
+    fi
+
+    # glue
+    if awsResourceList::regionSupports glue; then
+        awsResourceList::query '.Classifiers[] | "classifier:" + .Name' glue get-classifiers
+        awsResourceList::query '.ConnectionList[] | "connection:" + .Name' glue get-connections
+        awsResourceList::query '.Crawlers[] | "crawler:" + .Name' glue get-crawlers
+        awsResourceList::query '.DatabaseList[] | "database:" + .Name' glue get-databases
+        awsResourceList::query '.DevEndpoints[] | "endpoint:" + .Name' glue get-dev-endpoints
+        awsResourceList::query '.Jobs[] | "job:" + .Name' glue get-jobs
+        awsResourceList::query '.Triggers[] | "trigger:" + .Id + ":triggerName/" + .Name' glue get-triggers
+    fi
+
+    # greengrass
+    if awsResourceList::regionSupports greengrass; then
+        awsResourceList::query '.Definitions[] | .Arn' greengrass list-core-definitions
+        awsResourceList::query '.Definitions[] | .Arn' greengrass list-device-definitions
+        awsResourceList::query '.Definitions[] | .Arn' greengrass list-function-definitions
+        awsResourceList::query '.Groups[] | .Arn' greengrass list-groups
+        awsResourceList::query '.Definitions[] | .Arn' greengrass list-logger-definitions
+        awsResourceList::query '.Definitions[] | .Arn' greengrass list-subscription-definitions
+    fi
+
+    # health
+
+    # help
+
+    # iam - not region-specific
+
+    # importexport
+    if awsResourceList::regionSupports importexport; then
+        awsResourceList::query '.Jobs[] | "job:" + .JobId' importexport list-jobs
+    fi
+
+    # inspector
+    if awsResourceList::regionSupports inspector; then
+        awsResourceList::query '.assessmentRunArns[]' inspector list-assessment-runs
+        awsResourceList::query '.assessmentTargetArns[]' inspector list-assessment-targets
+        awsResourceList::query '.assessmentTemplateArns[]' inspector list-assessment-templates
+        awsResourceList::query '.findingArns[]' inspector list-findings
+        awsResourceList::query '.rulesPackageArns[]' inspector list-rules-packages
+    fi
+
+    # iot
+    if awsResourceList::regionSupports iot; then
+        awsResourceList::query '.certificates[] | .certificateArn' iot list-ca-certificates
+        awsResourceList::query '.certificates[] | .certificateArn' iot list-certificates
+        awsResourceList::query '.outgoingCertificates[] | .certificateArn' iot list-outgoing-certificates
+        awsResourceList::query '.policies[] | .policyArn' iot list-policies
+        awsResourceList::query '.thingTypes[] | "thingType:" + .thingTypeName' iot list-thing-types
+        awsResourceList::query '.things[] | "thing:" + .thingName' iot list-things
+        awsResourceList::query '.rules[] | .ruleArn' iot list-topic-rules
+    fi
+
+    # iot-data
+
+    # kinesis
+    if awsResourceList::regionSupports kinesis; then
+        awsResourceList::query '.StreamNames[] | "stream:" + .' kinesis list-streams
+    fi
+
+    # kinesisanalytics
+    if awsResourceList::regionSupports kinesisanalytics; then
+        awsResourceList::query '.ApplicationSummaries[] | .ApplicationARN' kinesisanalytics list-applications
+    fi
+
+    # kms
+    if awsResourceList::regionSupports kms; then
+        awsResourceList::query '.Aliases[] | .AliasArn' kms list-aliases
+        awsResourceList::query '.Keys[] | .KeyArn' kms list-keys
+    fi
+
+    # lambda
+    if awsResourceList::regionSupports lambda; then
+        awsResourceList::query '.Functions[] | .FunctionArn' lambda list-functions
+    fi
+
+    # lex-models
+    if awsResourceList::regionSupports lex-models; then
+        awsResourceList::query '.bots[] | "bot:" + .name' lex-models get-bots
+        awsResourceList::query '.intents[] | "intent:" + .name' lex-models get-intents
+        awsResourceList::query '.slotTypes[] | "slotType:" + .name' lex-models get-slot-types
+    fi
+
+    # lex-runtime
+
+    # lightsail
+    if awsResourceList::regionSupports lightsail; then
+        awsResourceList::query '.activeNames[] | "active:" + .' lightsail get-active-names
+        awsResourceList::query '.domains[] | .arn' lightsail get-domains
+        awsResourceList::query '.instances[] | .arn' lightsail get-instances
+        awsResourceList::query '.keyPairs[] | .arn' lightsail get-key-pairs
+        awsResourceList::query '.operations[] | "operation:" + .id + ":operationName/" + .resourceName' lightsail get-operations
+        awsResourceList::query '.staticIps[] | .arn' lightsail get-static-ips
+    fi
+
+    # logs
+    if awsResourceList::regionSupports logs; then
+        awsResourceList::query '.destinations[] | .arn' logs describe-destinations
+        awsResourceList::query '.exportTasks[] | "exportTask:" + .taskId + ":exportTaskName/" + .taskName' logs describe-export-tasks
+        awsResourceList::query '.logGroups[] | .arn' logs describe-log-groups
+        awsResourceList::query '.metricFilters[] | "metricFilter:" + .filterName' logs describe-metric-filters
+        awsResourceList::query '.resourcePolicies[] | "resourcePolicy:" + .policyName' logs describe-resource-policies
+    fi
+
+    # machinelearning
+    if awsResourceList::regionSupports machinelearning; then
+        awsResourceList::query '.Results[] | "batchPrediction:" + .BatchPredictionId' machinelearning describe-batch-predictions
+        awsResourceList::query '.Results[] | "dataSource:" + .DataSourceId' machinelearning describe-data-sources
+        awsResourceList::query '.Results[] | "evaluation:" + .EvaluationId' machinelearning describe-evaluations
+        awsResourceList::query '.Results[] | "mlModel:" + .MLModelId' machinelearning describe-ml-models
+    fi
+
+    # marketplace-entitlement
+
+    # marketplacecommerceanalytics
+
+    # meteringmarketplace
+
+    # mgh
+    if awsResourceList::regionSupports mgh; then
+        awsResourceList::query '.MigrationTaskSummaryList[] | "migrationTask:" + .MigrationTaskName' mgh list-migration-tasks
+        awsResourceList::query '.ProgressUpdateStreamSummaryList[] | "progressUpdateStream:" + .ProgressUpdateStreamName' mgh list-progress-update-streams
+    fi
+
+    # mobile
+    if awsResourceList::regionSupports mobile; then
+        awsResourceList::query '.bundleList[] | "bundle:" + .bundleId' mobile list-bundles
+        awsResourceList::query '.projects[] | "project:" + .projectId + ":projectName/" + .name' mobile list-projects
+    fi
+
+    # mturk
+    if awsResourceList::regionSupports mturk; then
+        awsResourceList::query '.HITs[] | "hit:" + .HITId + ":hitTitle/" + .Title' mturk list-hits
+        awsResourceList::query '.QualificationRequests[] | "qualificationRequest:" + .QualificationRequestId' mturk list-qualification-requests
+    fi
+
+    # opsworks
+    if awsResourceList::regionSupports opsworks; then
+        awsResourceList::query '.Stacks[] | "stack:" + .StackId' opsworks describe-stacks
+    fi
+
+    # opsworks-cm
+    if awsResourceList::regionSupports opsworks-cm; then
+        awsResourceList::query '.Backups[] | .BackupArn' opsworks-cm describe-backups
+        awsResourceList::query '.Servers[] | .ServerArn' opsworks-cm describe-servers
+    fi
+
+    # organizations
+
+    # pinpoint
+    if awsResourceList::regionSupports pinpoint; then
+        awsResourceList::query '.ApplicationsResponse.Item[] | "app:" + .Id + ":appName/" + .Name' pinpoint get-apps
+    fi
+
+    # polly
+
+    # rds
+    if awsResourceList::regionSupports rds; then
+        awsResourceList::query '.DBClusterParameterGroups[] | .DBClusterParameterGroupArn' rds describe-db-cluster-parameter-groups
+        awsResourceList::query '.DBClusterSnapshots[] | .DBClusterSnapshotArn' rds describe-db-cluster-snapshots
+        awsResourceList::query '.DBClusters[] | .DBClusterArn' rds describe-db-clusters
+        awsResourceList::query '.DBInstances[] | .DBInstanceArn' rds describe-db-instances
+        awsResourceList::query '.DBSecurityGroups[] | .DBSecurityGroupArn' rds describe-db-security-groups
+        awsResourceList::query '.DBSnapshots[] | .DBSnapshotArn' rds describe-db-snapshots
+        awsResourceList::query '.DBSubnetGroups[] | .DBSubnetGroupArn' rds describe-db-subnet-groups
+        awsResourceList::query '.ReservedDBInstances[] | .ReservedDBInstanceId' rds describe-reserved-db-instances
+    fi
+
+    # redshift
+    if awsResourceList::regionSupports redshift; then
+        awsResourceList::query '.ParameterGroups[] | "parameterGroup:" + .ParameterGroupName' redshift describe-cluster-parameter-groups
+        awsResourceList::query '.ClusterSecurityGroups[] | "clusterSecurityGroup:" + .ClusterSecurityGroupName' redshift describe-cluster-security-groups
+        awsResourceList::query '.Snapshots[] | "snapshot:" + .SnapshotIdentifier' redshift describe-cluster-snapshots
+        awsResourceList::query '.ClusterSubnetGroups[] | "subnetGroup:" + .ClusterSubnetGroupName' redshift describe-cluster-subnet-groups
+        awsResourceList::query '.Clusters[] | "cluster:" + .ClusterIdentifier' redshift describe-clusters
+        awsResourceList::query '.HsmClientCertificates[] | "hsmClientCertificate:" + .HsmClientCertificateIdentifier' redshift describe-hsm-client-certificates
+        awsResourceList::query '.HsmConfigurations[] | "hsmConfiguration:" + .HsmConfigurationIdentifier' redshift describe-hsm-configurations
+        awsResourceList::query '.ReservedNodes[] | "reservedNode:" + .ReservedNodeId' redshift describe-reserved-nodes
+        awsResourceList::query '.SnapshotCopyGrants[] | "snapshotCopyGrant:" + .SnapshotCopyGrantName' redshift describe-snapshot-copy-grants
+    fi
+
+    # rekognition
+    if awsResourceList::regionSupports rekognition; then
+        awsResourceList::query '.CollectionIds[] | "collection:" + .' rekognition list-collections
+    fi
+
+    # resourcegroupstaggingapi
+
+    # route53
+    if awsResourceList::regionSupports route53; then
+        awsResourceList::query '.HealthChecks[] | "healthCheck:" + .Id' route53 list-health-checks
+        awsResourceList::query '.HostedZones[] | "hostedZone:" + .Id + ":hostedZoneName/" + .Name' route53 list-hosted-zones
+        awsResourceList::query '.QueryLoggingConfigs[] | "queryLoggingConfig:" + .Id' route53 list-query-logging-configs
+        awsResourceList::query '.DelegationSets[] | "delegationSet:" + .Id' route53 list-reusable-delegation-sets
+        awsResourceList::query '.TrafficPolicySummaries[] | "trafficPolicy:" + .Id + ":trafficPolicyName/" + .Name' route53 list-traffic-policies
+        awsResourceList::query '.TrafficPolicyInstances[] | "trafficPolicyInstance:" + .Id + ":trafficPolicyName/" + .Name' route53 list-traffic-policy-instances
+    fi
+
+    # route53domains
+    if awsResourceList::regionSupports route53domains; then
+        awsResourceList::query '.Domains[] | "domain:" + .DomainName' route53domains list-domains
+        awsResourceList::query '.Operations[] | "operation:" + .OperationId' route53domains list-operations
+    fi
+
+    # s3 - Not really region-specific
+
+    # s3api - Not really region specific
+
+    # sdb (preview)
+    #     awsResourceList::query '.DomainNames[] | "domain:" + .' sdb list-domains
+    # fi
+
+    # servicecatalog
+    if awsResourceList::regionSupports servicecatalog; then
+        awsResourceList::query '.PortfolioDetails[] | .ARN' servicecatalog list-accepted-portfolio-shares
+        awsResourceList::query '.PortfolioDetails[] | .ARN' servicecatalog list-portfolios
+    fi
+
+    # ses
+    if awsResourceList::regionSupports ses; then
+        awsResourceList::query '.Rules[] | "rule:" + .Name' ses describe-active-receipt-rule-set
+        awsResourceList::query '.ConfigurationSets[] | "configurationSet:" + .Name' ses list-configuration-sets
+        awsResourceList::query '.Identities[] | "identity:" + .' ses list-identities
+        awsResourceList::query '.Filters[] | "filter:" + .Name' ses list-receipt-filters
+        awsResourceList::query '.RuleSets[] | "ruleSet:" + .Name' ses list-receipt-rule-sets
+    fi
+
+    # shield
+    if awsResourceList::regionSupports shield; then
+        awsResourceList::query '.Protections[] | "protection:" + .Id + ":protectionName/" + .Name' shield list-protections
+    fi
+
+    # sms
+
+    # snowball
+    if awsResourceList::regionSupports snowball; then
+        awsResourceList::query '.Addresses[] | "address:" + .AddressId' snowball describe-addresses
+        awsResourceList::query '.ClusterListEntries[] | "clusterList:" + .ClusterId' snowball list-clusters
+        awsResourceList::query '.JobListEntries[] | "jobList:" + .jobId' snowball list-jobs
+    fi
+
+    # sns
+    if awsResourceList::regionSupports sns; then
+        awsResourceList::query '.Subscriptions[] | .SubscriptionArn' sns list-subscriptions
+    fi
+
+    # sqs
+    if awsResourceList::regionSupports sqs; then
+        awsResourceList::query '.QueueUrls[] | "queue:" + .' sqs list-queues
+    fi
+
+    # ssm
+    if awsResourceList::regionSupports ssm; then
+        awsResourceList::query '.ActivationList[] | "activation:" + .ActivationId' ssm describe-activations
+        awsResourceList::query '.InstanceInformationList[] | "instance:" + .InstanceId' ssm describe-instance-information
+        awsResourceList::query '.WindowIdentities[] | "windowIdentity:" + .WindowId + ":windowIdentityName/" + .Name' ssm describe-maintenance-windows
+        awsResourceList::query '.Mappings[] | "patchGroup:" + .PatchGroup' ssm describe-patch-groups
+        awsResourceList::query '.Associations[] | "association:" + .AssociationId' ssm list-associations
+        awsResourceList::query '.Commands[] | "command:" + .CommandId' ssm list-commands
+        awsResourceList::query '.ResourceDataSyncItems[] | "dataSync:" + .Name' ssm list-resource-data-sync
+    fi
+
+    # stepfunctions
+    if awsResourceList::regionSupports stepfunctions; then
+        awsResourceList::query '.activities[] | .activityArn' stepfunctions list-activities
+        awsResourceList::query '.stateMachines[] | .stateMachineArn' stepfunctions list-state-machines
+    fi
+
+    # storagegateway
+    if awsResourceList::regionSupports storagegateway; then
+        awsResourceList::query '.TapeArchives[] | .TapeARN' storagegateway describe-tape-archives
+        awsResourceList::query '.FileShareInfoList[] | .FileShareARN' storagegateway list-file-shares
+        awsResourceList::query '.Gateways[] | .GatewayARN' storagegateway list-gateways
+        awsResourceList::query '.TapeInfos[] | .TapeARN' storagegateway list-tapes
+        awsResourceList::query '.VolumeInfos[] | .VolumeARN' storagegateway list-volumes
+    fi
+
+    # sts
+
+    # support
+
+    # swf
+    if awsResourceList::regionSupports swf; then
+        awsResourceList::query '.domainInfos[] | "domain:" + .name' swf list-domains --registration-status REGISTERED
+    fi
+
+    # waf
+    if awsResourceList::regionSupports waf; then
+        awsResourceList::query '.ByteMatchSets[] | "byteMatchSet:" + .ByteMatchSetId + ":byteMatchSetName/" + .Name' waf list-byte-match-sets
+        awsResourceList::query '.IPSets[] | "ipSet:" + .IPSetId + ":ipSetName/" + .Name' waf list-ip-sets
+        awsResourceList::query '.Rules[] | "rule:" + .RuleId + ":ruleName/" + .Name' waf list-rules
+        awsResourceList::query '.SizeConstraintSets[] | "sizeConstraintSet:" + .SizeConstraintSetId + ":sizeConstraintSetName/" + .Name' waf list-size-constraint-sets
+        awsResourceList::query '.SqlInjectionMatchSets[] | "sqlInjectionMatchSet:" + .SqlInjectionMatchSetId + ":sqlInjectionMatchSetName/" + .Name' waf list-sql-injection-match-sets
+        awsResourceList::query '.WebACLs[] | "webAcl:" + .WebACLId + ":webAclName/" + .Name' waf list-web-acls
+        awsResourceList::query '.XssMatchSets[] | "xssMatchSet:" + .XssMatchSetId + ":xssMatchSetName/" + .Name' waf list-xss-match-sets
+    fi
+
+    # waf-regional
+    if awsResourceList::regionSupports waf-regional; then
+        awsResourceList::query '.ByteMatchSets[] | "byteMatchSet:" + .ByteMatchSetId + ":byteMatchSetName/" + .Name' waf-regional list-byte-match-sets
+        awsResourceList::query '.IPSets[] | "ipSet:" + .IPSetId + ":ipSetName/" + .Name' waf-regional list-ip-sets
+        awsResourceList::query '.Rules[] | "rule:" + .RuleId + ":ruleName/" + .Name' waf-regional list-rules
+        awsResourceList::query '.SizeConstraintSets[] | "sizeConstraintSet:" + .SizeConstraintSetId + ":sizeConstraintSetName/" + .Name' waf-regional list-size-constraint-sets
+        awsResourceList::query '.SqlInjectionMatchSets[] | "sqlInjectionMatchSet:" + .SqlInjectionMatchSetId + ":sqlInjectionMatchSetName/" + .Name' waf-regional list-sql-injection-match-sets
+        awsResourceList::query '.WebACLs[] | "webAcl:" + .WebACLId + ":webAclName/" + .Name' waf-regional list-web-acls
+        awsResourceList::query '.XssMatchSets[] | "xssMatchSet:" + .XssMatchSetId + ":xssMatchSetName/" + .Name' waf-regional list-xss-match-sets
+    fi
+
+    # workdocs
+
+    # workspaces
+    if awsResourceList::regionSupports workspaces; then
+        awsResourceList::query '.Bundles[] | "bundle:" + .BundleId + ":bundleName/" + .Name' workspaces describe-workspace-bundles
+        awsResourceList::query '.Directories[] | "directory:" + .DirectoryId + ":directoryName/" + .DirectoryName' workspaces describe-workspace-directories
+        awsResourceList::query '.Workspaces[] | "workspace:" + .WorkspaceId + ":username/" + .UserName' workspaces describe-workspaces
+    fi
+
+    # xray
+}
+
+
+# Sets credentials in the environment using a JSON payload that contains
+# credentials.
+#
+# $1 - JSON that has credentials. See example JSON below.
+#
+# The JSON must have a "Credentials" key with the various credentials below.
+#
+#   {
+#       "Credentials": {
+#           "AccessKeyId": "AKIA....",
+#           "SecretAccessKey": "....",
+#           "SessionToken": "...."
+#       }
+#   }
+#
+# Returns nothing.
+awsResourceList::setCredentials() {
+    local json
+    
+    json="$1"
+    AWS_ACCESS_KEY_ID=$(jq -r .Credentials.AccessKeyId <<< "$json")
+    AWS_SECRET_ACCESS_KEY=$(jq -r .Credentials.SecretAccessKey <<< "$json")
+    AWS_SESSION_TOKEN=$(jq -r '.Credentials.SessionToken // ""' <<< "$json")
+    export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+}
+
+
+# Show basic account information as a header. Sets account information into
+# the environment.
+#
+# $1 - Account ID, found earlier
+# $2 - Regions to scan, tab separated
+#
+# Example
+#
+#   awsResourceList::showAccountInformation "123456789012" "eu-west-1 us-east-1"
+#
+# Returns nothing.
+awsResourceList::showAccountInformation() {
+    local accountId
+
+    accountId=$(awsResourceList::awsJq '.Account' sts get-caller-identity)
+    AWS_RESOURCE_LIST_ACCOUNT_ID=$accountId
+    export AWS_RESOURCE_LIST_ACCOUNT_ID
+    printf "Account ID:\t%s\n" "$accountId"
+    printf "Alias:\t%s\n" "$(awsResourceList::awsJq '.AccountAliases[0] // ""' iam list-account-aliases)"
+    printf "Regions:\t%s\n" "${2//$'\t'/,}"
+}
+
+
+AWS_RESOURCE_LIST_ORIGINAL_COMMAND="$(cd "${BASH_SOURCE[0]%/*}" || exit 1; pwd)/${BASH_SOURCE[0]##*/}"
+
+if ! bpm::isSourced; then
+    aws-resource-list "$@"
+fi
