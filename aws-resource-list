@@ -66,7 +66,7 @@ aws-resource-list() {
         if [[ -n "$regions" ]]; then
             string::split regions "$regions" ","
         else
-            regions=( global $(awsResourceList::awsJq '.Regions[].RegionName' ec2 describe-regions | sort) )
+            regions=( global $(awsResourceList::awsJq '.Regions[].RegionName' --region us-east-1 ec2 describe-regions | sort) )
         fi
 
         if [[ -n "$parallel" && "$parallel" -gt 0 ]]; then
